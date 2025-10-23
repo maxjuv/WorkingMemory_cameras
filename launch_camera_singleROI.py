@@ -73,7 +73,8 @@ class FLIRApp:
         self.ttl_log = []  # store timestamps for current trial
         self.frames_times_log = []  # store timestamps for current trial
         self.start_rec_time_hardware =None
-
+        self.preview_enabled = tk.BooleanVar(value=True)
+        self.last_preview_enabled = tk.BooleanVar(value=True)
         # GUI Layout
         tk.Button(root, text="Select Save path", command=self.select_folder).pack()
         tk.Label(root, textvariable=self.save_path).pack()
@@ -105,6 +106,8 @@ class FLIRApp:
         tk.Button(root, text="Stop Acquisition", command=self.stop_acquisition).pack(side="left", padx=5)
         tk.Button(root, text="Start Recording", command=self.start_recording).pack(side="left", padx=5)
         tk.Button(root, text="Stop Recording", command=self.stop_recording).pack(side="left", padx=5)
+
+        tk.Checkbutton(root, text="Enable Preview", variable=self.preview_enabled).pack()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -176,46 +179,45 @@ class FLIRApp:
         cv2.setMouseCallback("FLIR Preview", mouse_callback)
 
         while self.acquiring:
+            current_preview_enabled = self.preview_enabled.get()
             image = self.cam.GetNextImage()
             frame_timestamp = image.GetTimeStamp()  # uint64, in microseconds
             if image.IsIncomplete():
                 print('frame drop !')
                 width = self.cam.Width.GetValue()
                 height = self.cam.Height.GetValue()
-                image_array = np.zeros((height, width), dtype=np.uint8)
+                frame_rec = np.zeros((height, width), dtype=np.uint8)
             else : 
-                image_array = image.GetNDArray()  # convert PySpin image to NumPy array   
- 
-            image.Release()
-            rot_angle = self.rotation.get()
-            if rot_angle == 90:
-                image_array = np.rot90(image_array, k=1)  # rotate 90° counterclockwise
-            elif rot_angle == 180:
-                image_array = np.rot90(image_array, k=2)
-            elif rot_angle == 270:
-                image_array = np.rot90(image_array, k=3)
-
-            frame_disp = np.copy(image_array)
-            frame_rec = np.copy(image_array)
-
-            frame_disp = np.ascontiguousarray(frame_disp)
-            frame_disp = frame_disp.astype(np.uint8)
-
-            # frame_disp = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2BGR)  # convert if needed
-
-            # Draw ROI during selection
-            if roi_start and roi_end and (not self.recording or self.roi_defined):
-                x1, y1 = roi_start
-                x2, y2 = roi_end
-                cv2.rectangle(frame_disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            # Apply ROI if defined
+                frame_rec = image.GetNDArray()  # convert PySpin image to NumPy array   
             if self.roi_defined:
                 x, y, w, h = self.roi
-                frame_rec = frame_disp[y:y+h, x:x+w]
-                frame_disp = frame_disp[y:y+h, x:x+w]
+                frame_rec = frame_rec[y:y+h, x:x+w]
 
-        
+            image.Release()
+            if self.last_preview_enabled and not current_preview_enabled:
+                cv2.destroyWindow("FLIR Preview")
+            if current_preview_enabled:
+                rot_angle = self.rotation.get()
+                frame_disp = np.copy(frame_rec)
+                if rot_angle == 90:
+                        frame_disp = cv2.rotate(frame_disp, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                elif rot_angle == 180:
+                    frame_disp = cv2.rotate(frame_disp, cv2.ROTATE_180)
+                elif rot_angle == 270:
+                    frame_disp = cv2.rotate(frame_disp, cv2.ROTATE_90_CLOCKWISE)
+
+                frame_disp = np.ascontiguousarray(frame_disp)
+                frame_disp = frame_disp.astype(np.uint8)
+
+                # frame_disp = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2BGR)  # convert if needed
+
+                # Draw ROI during selection
+                if roi_start and roi_end and (not self.recording or self.roi_defined):
+                    x1, y1 = roi_start
+                    x2, y2 = roi_end
+                    cv2.rectangle(frame_disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            
             # Recording logic
             if self.mode.get() == "Trigger" and self.recording:
                 trigger_line_state = self.get_line_status(trigger_line_id)
@@ -244,20 +246,26 @@ class FLIRApp:
                 timestamp_sec = (frame_timestamp - self.start_rec_time_hardware) / 1e6
                 self.frames_times_log.append(timestamp_sec)
                 self.writer.append_data(frame_rec)
-                cv2.putText(frame_disp, f"Rec. trial{self.trial_index}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                            1.0, (0, 0, 255), 2, cv2.LINE_AA)
+                if current_preview_enabled:
+                    cv2.putText(frame_disp, f"Rec. trial{self.trial_index}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                1.0, (0, 0, 255), 2, cv2.LINE_AA)
+            if current_preview_enabled:
+                cv2.imshow("FLIR Preview", frame_disp)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('c') and not self.recording:
+                    if roi_start and roi_end:
+                        x1, y1 = roi_start
+                        x2, y2 = roi_end
+                        w = (abs(x2-x1)//16)*16
+                        h = (abs(y2-y1)//16)*16
+                        x_raw, y_raw, w_raw, h_raw = map_roi_to_raw(
+                            min(x1, x2), min(y1, y2), w, h, frame_rec.shape, self.rotation.get()
+                        )
 
-            cv2.imshow("FLIR Preview", frame_disp)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('c') and not self.recording:
-                if roi_start and roi_end:
-                    x1, y1 = roi_start
-                    x2, y2 = roi_end
-                    w = (abs(x2-x1)//16)*16
-                    h = (abs(y2-y1)//16)*16
-                    self.roi = (min(x1,x2), min(y1,y2), w, h)
-                    self.roi_defined = True
-                    print(f"ROI defined: {self.roi}")
+                        # Save the mapped coordinates for cropping raw frame
+                        self.roi = (x_raw, y_raw, w_raw, h_raw)
+                        self.roi_defined = True
+                        print(f"ROI defined: {self.roi}")
             elif key == ord('f') and not self.recording:
                 self.roi_defined = False
                 self.roi = None
@@ -265,6 +273,7 @@ class FLIRApp:
             # elif key == 27:
             #     self.acquiring = False
             last_sync_line_state = sync_line_state
+            self.last_preview_enabled = current_preview_enabled
         # Cleanup
         self.stop_writer()
         self.cam.EndAcquisition()
@@ -361,6 +370,37 @@ class FLIRApp:
             print(f"Warning: system release failed: {e}")
 
         self.root.destroy() 
+
+def map_roi_to_raw(x, y, w, h, raw_shape, rot_angle):
+    """Map ROI from rotated preview to raw frame coordinates."""
+    H, W = raw_shape[:2]
+
+    if rot_angle == 90:
+        x_raw = y
+        y_raw = W - (x + w)
+        w_raw = h
+        h_raw = w
+    elif rot_angle == 180:
+        x_raw = W - (x + w)
+        y_raw = H - (y + h)
+        w_raw = w
+        h_raw = h
+    elif rot_angle == 270:
+        x_raw = H - (y + h)
+        y_raw = x
+        w_raw = h
+        h_raw = w
+    else:  # 0 degrees
+        x_raw, y_raw, w_raw, h_raw = x, y, w, h
+
+    # Make sure coordinates are within bounds
+    x_raw = max(0, x_raw)
+    y_raw = max(0, y_raw)
+    w_raw = min(W - x_raw, w_raw)
+    h_raw = min(H - y_raw, h_raw)
+    return x_raw, y_raw, w_raw, h_raw
+
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = FLIRApp(root)
