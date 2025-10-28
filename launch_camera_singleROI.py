@@ -40,6 +40,16 @@ class FLIRApp:
         line_mode_in  = line_mode.GetEntryByName("Input")
         line_inv      = PySpin.CBooleanPtr(nodemap.GetNode("LineInverter"))
 
+
+        width_node = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
+        height_node = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
+
+        self.default_frame_width = width_node.GetValue()
+        self.default_frame_height = height_node.GetValue()
+
+        self.frame_width = self.default_frame_width
+        self.frame_height = self.default_frame_height
+
         print('######################################################### \n'
         'To crop : select with mouse then press "c"  \n'
         'To go back full size, press "f" \n'
@@ -285,11 +295,16 @@ class FLIRApp:
                         # self.roi = (x_raw, y_raw, w_raw, h_raw)
                         ######################################################################################
                         self.roi = (min(x1, x2), min(y1, y2), w, h)
+                        self.frame_width = w
+                        self.frame_height =h
+
                         self.roi_defined = True
                         print(f"ROI defined: {self.roi}")
                 elif key == ord('f') and not self.recording:
                     self.roi_defined = False
                     self.roi = None
+                    self.frame_width = self.default_frame_width
+                    self.frame_height = self.default_frame_height
                     print("Reset to full frame")
             last_sync_line_state = sync_line_state
             self.last_preview_enabled = current_preview_enabled
@@ -325,29 +340,65 @@ class FLIRApp:
         t.active = False
         t.stop_flag = False
         t.filename = filename
-        t.codec = "ffv1" if self.compression.get() == "FFV1" else "rawvideo"
+        # t.codec = "ffv1" if self.compression.get() == "FFV1" else "rawvideo"  ## imageio style
+        t.codec = "FFV1" if self.compression.get() == "FFV1" else "Y800"   ###opencv
         t.start()
         print(f"[Writer] Prewarmed writer for trial {trial_index}")
         return t
 
+    # def writer_thread(self):
+    #     t = threading.current_thread()
+    #     writer = imageio.get_writer(t.filename, fps=self.fps.get(), codec=t.codec)  
+    #     fps = self.fps.get()
+    #     while True:
+    #         if getattr(t, "active", False): 
+    #             frame = None
+    #             with self.queue_lock:
+    #                 if self.frame_queue:
+    #                     frame = self.frame_queue.popleft()
+    #             if frame is not None:
+    #                 writer.append_data(frame)
+    #             else:
+    #                 time.sleep(0.001)
+    #         elif getattr(t, "stop_flag", False):
+    #             break
+    #         else:
+    #             time.sleep(0.1)
+    #     writer.close()
+    #     print(f"[Writer] Finished writing {t.filename}")
+
     def writer_thread(self):
+        """Writer thread using OpenCV (pre-sized, no lazy init)."""
         t = threading.current_thread()
-        writer = imageio.get_writer(t.filename, fps=self.fps.get(), codec=t.codec)  
+        fourcc = cv2.VideoWriter_fourcc(*t.codec)
+        fps = self.fps.get()
+
+        # Directly use dimensions from the main class
+        w, h = self.frame_width, self.frame_height
+        writer = cv2.VideoWriter(t.filename, fourcc, fps, (h, w), isColor=False)
+
+        if not writer.isOpened():
+            print(f"[Writer] ERROR: could not open {t.filename} with codec {t.codec}")
+            return
+
+        print(f"[Writer] Started {t.filename} ({t.codec}, {w}x{h})")
+
         while True:
-            if getattr(t, "active", False): 
+            if getattr(t, "active", False):
                 frame = None
                 with self.queue_lock:
                     if self.frame_queue:
                         frame = self.frame_queue.popleft()
                 if frame is not None:
-                    writer.append_data(frame)
+                    writer.write(frame)
                 else:
                     time.sleep(0.001)
             elif getattr(t, "stop_flag", False):
                 break
             else:
                 time.sleep(0.1)
-        writer.close()
+
+        writer.release()
         print(f"[Writer] Finished writing {t.filename}")
 
     def stop_writer(self):
@@ -483,3 +534,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = FLIRApp(root)
     root.mainloop()
+
+
+
