@@ -41,15 +41,6 @@ class FLIRApp:
         line_inv      = PySpin.CBooleanPtr(nodemap.GetNode("LineInverter"))
 
 
-        width_node = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
-        height_node = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
-
-        self.default_frame_width = width_node.GetValue()
-        self.default_frame_height = height_node.GetValue()
-
-        self.frame_width = self.default_frame_width
-        self.frame_height = self.default_frame_height
-
         print('######################################################### \n'
         'To crop : select with mouse then press "c"  \n'
         'To go back full size, press "f" \n'
@@ -66,8 +57,15 @@ class FLIRApp:
         self.queue_lock = threading.Lock()  # optional, for safety
         self.current_thread_writer = None
         self.next_thread_writer = None
+        self.next_thread_writer_filename = None
+
+        self.frame_lock = threading.Lock()
 
 
+        self.update_writer=False
+        with self.frame_lock:
+            self.frame_width = None
+            self.frame_height = None
 
         # State Variables
         self.acquiring = False
@@ -75,7 +73,6 @@ class FLIRApp:
         self.roi_defined = False
         self.roi = None  # (x, y, w, h)
         self.rotation = tk.IntVar(value=270)  # 0, 90, 180, 270
-        # self.save_path = tk.StringVar(value=os.getcwd())
         self.save_path = tk.StringVar(value=default_path)
         self.foldername = tk.StringVar(value=default_foldername)
         
@@ -83,7 +80,8 @@ class FLIRApp:
         self.fps = tk.DoubleVar(value=30.0)
         self.brightness = tk.DoubleVar(value=1.0)
         self.compression = tk.StringVar(value="FFV1")
-        self.exposure_time = tk.DoubleVar(value=5000.0)  # microseconds (example default 5 ms)
+        self.last_compression = self.compression.get()
+        self.exposure_time = tk.DoubleVar(value=15.0)  # microseconds (example default 5 ms)
         self.trial_index = 0
         self.ttl_log = []  # store timestamps for current trial
         self.frames_times_log = []  # store timestamps for current trial
@@ -114,7 +112,7 @@ class FLIRApp:
         tk.Entry(root, textvariable=self.brightness).pack()
 
 
-        tk.Label(root, text="Exposure time (µs):").pack()
+        tk.Label(root, text="Exposure time (ms):").pack()
         tk.Entry(root, textvariable=self.exposure_time).pack()
 
         tk.Button(root, text="Start Acquisition", command=self.start_acquisition).pack(side="left", padx=5)
@@ -156,13 +154,11 @@ class FLIRApp:
         self.cam.Gain.SetValue(self.brightness.get())
         self.cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
         max_exposure_us = 1_000_000 / self.fps.get()
-        exposure_time = min(self.exposure_time.get(), max_exposure_us)
+        exposure_time = min(self.exposure_time.get()*1000, max_exposure_us)
         self.cam.ExposureTime.SetValue(exposure_time)
 
         self.check_save_path()
     
-        ### prepare first writer
-        self.next_thread_writer = self.prepare_next_writer(self.trial_index)
 
         # Start acquisition thread
         self.thread = threading.Thread(target=self.acquire_loop, daemon=True)
@@ -197,14 +193,21 @@ class FLIRApp:
         rot_angle = self.rotation.get()
 
         while self.acquiring:
+
+            current_compression = self.compression.get()
+            if current_compression != self.last_compression:
+                print(f"Compression changed: {self.last_compression} → {current_compression}")
+                self.last_compression = current_compression
+                self.update_writer = True  # trigger next writer preparation
+
             current_preview_enabled = self.preview_enabled.get()
             image = self.cam.GetNextImage()
             frame_timestamp = image.GetTimeStamp()  # uint64, in microseconds
             if image.IsIncomplete():
                 print('frame drop !')
-                width = self.cam.Width.GetValue()
-                height = self.cam.Height.GetValue()
-                frame_rec = np.zeros((height, width), dtype=np.uint8)
+                width_drop = self.cam.Width.GetValue()
+                height_drop = self.cam.Height.GetValue()
+                frame_rec = np.zeros((height_drop, width_drop), dtype=np.uint8)
             else : 
                 frame_rec = image.GetNDArray()  # convert PySpin image to NumPy array   
             if rot_angle == 90:
@@ -214,10 +217,16 @@ class FLIRApp:
             elif rot_angle == 270:
                 frame_rec = cv2.rotate(frame_rec, cv2.ROTATE_90_CLOCKWISE)
 
-            full_frame_shape = frame_rec.shape
             if self.roi_defined:
                 x, y, w, h = self.roi
                 frame_rec = frame_rec[y:y+h, x:x+w]
+            h, w = frame_rec.shape
+            with self.frame_lock:
+                self.frame_width = w
+                self.frame_height = h
+            if self.update_writer :
+                self.next_thread_writer = self.prepare_next_writer(self.trial_index)
+            self.update_writer = False
 
             image.Release()
             if self.last_preview_enabled and not current_preview_enabled:
@@ -225,14 +234,6 @@ class FLIRApp:
             if current_preview_enabled:
                 rot_angle = self.rotation.get()
                 frame_disp = np.copy(frame_rec)
-                    ############## if you want to rotate display only to alleviate cpu load ##############
-                    # if rot_angle == 90:
-                    #     frame_disp = cv2.rotate(frame_disp, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                    # elif rot_angle == 180:
-                    #     frame_disp = cv2.rotate(frame_disp, cv2.ROTATE_180)
-                    # elif rot_angle == 270:
-                    #     frame_disp = cv2.rotate(frame_disp, cv2.ROTATE_90_CLOCKWISE)
-                    ######################################################################################
                 frame_disp = np.ascontiguousarray(frame_disp)
                 frame_disp = frame_disp.astype(np.uint8)
                 # Draw ROI during selection
@@ -282,30 +283,25 @@ class FLIRApp:
                 cv2.imshow("FLIR Preview", frame_disp)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('c') and not self.recording:
-                    if roi_start and roi_end:
+                    if self.roi_defined:
+                        print("ROI already defined, ignoring 'c'")
+                    elif roi_start and roi_end:
                         x1, y1 = roi_start
                         x2, y2 = roi_end
                         w = (abs(x2-x1)//16)*16
                         h = (abs(y2-y1)//16)*16
-                        ############## if you want to rotate display only to alleviate cpu load ##############
-                        # x_raw, y_raw, w_raw, h_raw = map_roi_to_raw(
-                        #     min(x1, x2), min(y1, y2), w, h, full_frame_shape, self.rotation.get()
-                        # )
-
-                        # self.roi = (x_raw, y_raw, w_raw, h_raw)
-                        ######################################################################################
                         self.roi = (min(x1, x2), min(y1, y2), w, h)
-                        self.frame_width = w
-                        self.frame_height =h
-
                         self.roi_defined = True
                         print(f"ROI defined: {self.roi}")
+                        self.update_writer = True
+
                 elif key == ord('f') and not self.recording:
                     self.roi_defined = False
                     self.roi = None
-                    self.frame_width = self.default_frame_width
-                    self.frame_height = self.default_frame_height
                     print("Reset to full frame")
+                    self.update_writer = True
+
+
             last_sync_line_state = sync_line_state
             self.last_preview_enabled = current_preview_enabled
         # Cleanup
@@ -336,6 +332,16 @@ class FLIRApp:
             self.save_path.get(),
             f"{datetime.datetime.now():%Y%m%d_%Hh%M}_trial{trial_index}.{ext}"  ### issue extension
         )
+
+        already_prep_thread = self.next_thread_writer
+        if already_prep_thread is not None :
+            already_prepared_filename = self.next_thread_writer_filename
+            already_prep_thread.active = False
+            already_prep_thread.stop_flag = True
+            already_prep_thread.join(timeout=1)
+            os.remove(already_prepared_filename)
+            print('[Writer] stop unused prepared thread and erase 0-frame video')
+        self.next_thread_writer_filename = filename
         t = threading.Thread(target=self.writer_thread, daemon=True)
         t.active = False
         t.stop_flag = False
@@ -346,43 +352,21 @@ class FLIRApp:
         print(f"[Writer] Prewarmed writer for trial {trial_index}")
         return t
 
-    # def writer_thread(self):
-    #     t = threading.current_thread()
-    #     writer = imageio.get_writer(t.filename, fps=self.fps.get(), codec=t.codec)  
-    #     fps = self.fps.get()
-    #     while True:
-    #         if getattr(t, "active", False): 
-    #             frame = None
-    #             with self.queue_lock:
-    #                 if self.frame_queue:
-    #                     frame = self.frame_queue.popleft()
-    #             if frame is not None:
-    #                 writer.append_data(frame)
-    #             else:
-    #                 time.sleep(0.001)
-    #         elif getattr(t, "stop_flag", False):
-    #             break
-    #         else:
-    #             time.sleep(0.1)
-    #     writer.close()
-    #     print(f"[Writer] Finished writing {t.filename}")
-
     def writer_thread(self):
         """Writer thread using OpenCV (pre-sized, no lazy init)."""
         t = threading.current_thread()
         fourcc = cv2.VideoWriter_fourcc(*t.codec)
         fps = self.fps.get()
-
+        with self.frame_lock:
+            width = self.frame_width
+            height = self.frame_height
         # Directly use dimensions from the main class
-        w, h = self.frame_width, self.frame_height
-        writer = cv2.VideoWriter(t.filename, fourcc, fps, (h, w), isColor=False)
-
+        writer = cv2.VideoWriter(t.filename, fourcc, fps, (width, height), isColor=False)
         if not writer.isOpened():
             print(f"[Writer] ERROR: could not open {t.filename} with codec {t.codec}")
             return
 
-        print(f"[Writer] Started {t.filename} ({t.codec}, {w}x{h})")
-
+        print(f"[Writer] Started {t.filename} ({t.codec}, {width}x{height})")
         while True:
             if getattr(t, "active", False):
                 frame = None
@@ -455,6 +439,9 @@ class FLIRApp:
     def start_recording(self):
         if not self.acquiring or self.recording:
             return
+        ### prepare first writer
+        if self.trial_index == 0:
+            self.next_thread_writer = self.prepare_next_writer(self.trial_index)
         self.recording = True
         self.check_save_path()
         print("Recording started")
@@ -464,6 +451,7 @@ class FLIRApp:
 
         if self.current_thread_writer and self.current_thread_writer.is_alive():
             self.stop_writer()
+
 
         print("Recording stopped")
 
@@ -488,47 +476,6 @@ class FLIRApp:
             print(f"Warning: system release failed: {e}")
 
         self.root.destroy() 
-
-def map_roi_to_raw(x, y, w, h, raw_shape, rot_angle):
-    """
-    Map ROI from display (rotated) to raw (unrotated) coordinates.
-    Compatible with cv2.rotate rotations:
-      90°  = cv2.ROTATE_90_COUNTERCLOCKWISE
-      180° = cv2.ROTATE_180
-      270° = cv2.ROTATE_90_CLOCKWISE
-    """
-    H, W = raw_shape[:2]
-
-    if rot_angle == 0:
-        x_raw, y_raw, w_raw, h_raw = x, y, w, h
-
-    elif rot_angle == 90:  # display is CCW from raw
-        x_raw = W - (y + h)
-        y_raw = x
-        w_raw = h
-        h_raw = w
-
-    elif rot_angle == 180:
-        x_raw = W - (x + w)
-        y_raw = H - (y + h)
-        w_raw = w
-        h_raw = h
-
-    elif rot_angle == 270:  # display is CW from raw
-        x_raw = y
-        y_raw = H - (x + w)
-        w_raw = h
-        h_raw = w
-
-    else:
-        raise ValueError(f"Invalid rotation angle: {rot_angle}")
-
-    # clamp to frame
-    x_raw = max(0, min(W - w_raw, x_raw))
-    y_raw = max(0, min(H - h_raw, y_raw))
-
-    print(f"[map_roi_to_raw] rot={rot_angle} -> raw=({x_raw},{y_raw},{w_raw},{h_raw})")
-    return int(x_raw), int(y_raw), int(w_raw), int(h_raw)
 
 if __name__ == "__main__":
     root = tk.Tk()
