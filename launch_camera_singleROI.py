@@ -1,11 +1,12 @@
 import PySpin
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from collections import deque
 import threading
 import os
 import cv2
 import numpy as np
-import imageio
+# import imageio
 import datetime
 import time
 import csv
@@ -15,7 +16,6 @@ default_foldername = None
 
 sync_line_id = 2
 trigger_line_id = 0
-
 
 class FLIRApp:
     def __init__(self, root):
@@ -32,13 +32,14 @@ class FLIRApp:
             return
         self.cam = cam_list[0]
         self.cam.Init()
-
+        
         nodemap = self.cam.GetNodeMap()
 
         line_selector = PySpin.CEnumerationPtr(nodemap.GetNode("LineSelector"))
         line_mode     = PySpin.CEnumerationPtr(nodemap.GetNode("LineMode"))
         line_mode_in  = line_mode.GetEntryByName("Input")
         line_inv      = PySpin.CBooleanPtr(nodemap.GetNode("LineInverter"))
+
 
         print('######################################################### \n'
         'To crop : select with mouse then press "c"  \n'
@@ -52,7 +53,19 @@ class FLIRApp:
             line_inv.SetValue(False)  # set True if polarity looks flipped
 
 
-        self.writer = None
+        self.frame_queue = deque()  # frames go from acquisition to writer
+        self.queue_lock = threading.Lock()  # optional, for safety
+        self.current_thread_writer = None
+        self.next_thread_writer = None
+        self.next_thread_writer_filename = None
+
+        self.frame_lock = threading.Lock()
+
+
+        self.update_writer=False
+        with self.frame_lock:
+            self.frame_width = None
+            self.frame_height = None
 
         # State Variables
         self.acquiring = False
@@ -60,7 +73,6 @@ class FLIRApp:
         self.roi_defined = False
         self.roi = None  # (x, y, w, h)
         self.rotation = tk.IntVar(value=270)  # 0, 90, 180, 270
-        # self.save_path = tk.StringVar(value=os.getcwd())
         self.save_path = tk.StringVar(value=default_path)
         self.foldername = tk.StringVar(value=default_foldername)
         
@@ -68,12 +80,14 @@ class FLIRApp:
         self.fps = tk.DoubleVar(value=30.0)
         self.brightness = tk.DoubleVar(value=1.0)
         self.compression = tk.StringVar(value="FFV1")
-        self.exposure_time = tk.DoubleVar(value=5000.0)  # microseconds (example default 5 ms)
+        self.last_compression = self.compression.get()
+        self.exposure_time = tk.DoubleVar(value=15.0)  # microseconds (example default 5 ms)
         self.trial_index = 0
         self.ttl_log = []  # store timestamps for current trial
         self.frames_times_log = []  # store timestamps for current trial
         self.start_rec_time_hardware =None
-
+        self.preview_enabled = tk.BooleanVar(value=True)
+        self.last_preview_enabled = tk.BooleanVar(value=True)
         # GUI Layout
         tk.Button(root, text="Select Save path", command=self.select_folder).pack()
         tk.Label(root, textvariable=self.save_path).pack()
@@ -98,13 +112,15 @@ class FLIRApp:
         tk.Entry(root, textvariable=self.brightness).pack()
 
 
-        tk.Label(root, text="Exposure time (µs):").pack()
+        tk.Label(root, text="Exposure time (ms):").pack()
         tk.Entry(root, textvariable=self.exposure_time).pack()
 
         tk.Button(root, text="Start Acquisition", command=self.start_acquisition).pack(side="left", padx=5)
         tk.Button(root, text="Stop Acquisition", command=self.stop_acquisition).pack(side="left", padx=5)
         tk.Button(root, text="Start Recording", command=self.start_recording).pack(side="left", padx=5)
         tk.Button(root, text="Stop Recording", command=self.stop_recording).pack(side="left", padx=5)
+
+        tk.Checkbutton(root, text="Enable Preview", variable=self.preview_enabled).pack()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -138,11 +154,12 @@ class FLIRApp:
         self.cam.Gain.SetValue(self.brightness.get())
         self.cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
         max_exposure_us = 1_000_000 / self.fps.get()
-        exposure_time = min(self.exposure_time.get(), max_exposure_us)
+        exposure_time = min(self.exposure_time.get()*1000, max_exposure_us)
         self.cam.ExposureTime.SetValue(exposure_time)
 
         self.check_save_path()
     
+
         # Start acquisition thread
         self.thread = threading.Thread(target=self.acquire_loop, daemon=True)
         self.thread.start()
@@ -172,50 +189,60 @@ class FLIRApp:
             elif event == cv2.EVENT_LBUTTONUP:
                 drawing = False
                 roi_end = (x, y)
-
         cv2.setMouseCallback("FLIR Preview", mouse_callback)
+        rot_angle = self.rotation.get()
 
         while self.acquiring:
+
+            current_compression = self.compression.get()
+            if current_compression != self.last_compression:
+                print(f"Compression changed: {self.last_compression} → {current_compression}")
+                self.last_compression = current_compression
+                self.update_writer = True  # trigger next writer preparation
+
+            current_preview_enabled = self.preview_enabled.get()
             image = self.cam.GetNextImage()
             frame_timestamp = image.GetTimeStamp()  # uint64, in microseconds
             if image.IsIncomplete():
                 print('frame drop !')
-                width = self.cam.Width.GetValue()
-                height = self.cam.Height.GetValue()
-                image_array = np.zeros((height, width), dtype=np.uint8)
+                width_drop = self.cam.Width.GetValue()
+                height_drop = self.cam.Height.GetValue()
+                frame_rec = np.zeros((height_drop, width_drop), dtype=np.uint8)
             else : 
-                image_array = image.GetNDArray()  # convert PySpin image to NumPy array   
- 
-            image.Release()
-            rot_angle = self.rotation.get()
+                frame_rec = image.GetNDArray()  # convert PySpin image to NumPy array   
             if rot_angle == 90:
-                image_array = np.rot90(image_array, k=1)  # rotate 90° counterclockwise
+                frame_rec = cv2.rotate(frame_rec, cv2.ROTATE_90_COUNTERCLOCKWISE)
             elif rot_angle == 180:
-                image_array = np.rot90(image_array, k=2)
+                frame_rec = cv2.rotate(frame_rec, cv2.ROTATE_180)
             elif rot_angle == 270:
-                image_array = np.rot90(image_array, k=3)
+                frame_rec = cv2.rotate(frame_rec, cv2.ROTATE_90_CLOCKWISE)
 
-            frame_disp = np.copy(image_array)
-            frame_rec = np.copy(image_array)
-
-            frame_disp = np.ascontiguousarray(frame_disp)
-            frame_disp = frame_disp.astype(np.uint8)
-
-            # frame_disp = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2BGR)  # convert if needed
-
-            # Draw ROI during selection
-            if roi_start and roi_end and (not self.recording or self.roi_defined):
-                x1, y1 = roi_start
-                x2, y2 = roi_end
-                cv2.rectangle(frame_disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            # Apply ROI if defined
             if self.roi_defined:
                 x, y, w, h = self.roi
-                frame_rec = frame_disp[y:y+h, x:x+w]
-                frame_disp = frame_disp[y:y+h, x:x+w]
+                frame_rec = frame_rec[y:y+h, x:x+w]
+            h, w = frame_rec.shape
+            with self.frame_lock:
+                self.frame_width = w
+                self.frame_height = h
+            if self.update_writer :
+                self.next_thread_writer = self.prepare_next_writer(self.trial_index)
+            self.update_writer = False
 
-        
+            image.Release()
+            if self.last_preview_enabled and not current_preview_enabled:
+                cv2.destroyWindow("FLIR Preview")
+            if current_preview_enabled:
+                rot_angle = self.rotation.get()
+                frame_disp = np.copy(frame_rec)
+                frame_disp = np.ascontiguousarray(frame_disp)
+                frame_disp = frame_disp.astype(np.uint8)
+                # Draw ROI during selection
+                if roi_start and roi_end and (not self.recording or self.roi_defined):
+                    x1, y1 = roi_start
+                    x2, y2 = roi_end
+                    cv2.rectangle(frame_disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            
             # Recording logic
             if self.mode.get() == "Trigger" and self.recording:
                 trigger_line_state = self.get_line_status(trigger_line_id)
@@ -227,13 +254,14 @@ class FLIRApp:
                     self.stop_writer()
                 last_trigger_line_state = trigger_line_state
             else:  # Continuous mode
-                if self.recording and self.writer is None:
+                if self.recording and self.current_thread_writer is None and self.next_thread_writer is not None:
                     self.start_writer()
-                elif not self.recording and self.writer:
+                elif not self.recording and self.current_thread_writer is not None:
                     self.stop_writer()
 
+
       # Append frame if recording
-            if self.writer:
+            if self.current_thread_writer:
                 if self.start_rec_time_hardware is None:
                     self.start_rec_time_hardware = frame_timestamp
 
@@ -243,77 +271,160 @@ class FLIRApp:
                     self.ttl_log.append(timestamp)
                 timestamp_sec = (frame_timestamp - self.start_rec_time_hardware) / 1e6
                 self.frames_times_log.append(timestamp_sec)
-                self.writer.append_data(frame_rec)
-                cv2.putText(frame_disp, f"Rec. trial{self.trial_index}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                            1.0, (0, 0, 255), 2, cv2.LINE_AA)
+                frame_to_push = frame_rec.copy()
+                with self.queue_lock:
+                    self.frame_queue.append(frame_to_push)
+    
 
-            cv2.imshow("FLIR Preview", frame_disp)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('c') and not self.recording:
-                if roi_start and roi_end:
-                    x1, y1 = roi_start
-                    x2, y2 = roi_end
-                    w = (abs(x2-x1)//16)*16
-                    h = (abs(y2-y1)//16)*16
-                    self.roi = (min(x1,x2), min(y1,y2), w, h)
-                    self.roi_defined = True
-                    print(f"ROI defined: {self.roi}")
-            elif key == ord('f') and not self.recording:
-                self.roi_defined = False
-                self.roi = None
-                print("Reset to full frame")
-            # elif key == 27:
-            #     self.acquiring = False
+                if current_preview_enabled:
+                    cv2.putText(frame_disp, f"Rec. trial{self.trial_index}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                1.0, (0, 0, 255), 2, cv2.LINE_AA)
+            if current_preview_enabled:
+                cv2.imshow("FLIR Preview", frame_disp)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('c') and not self.recording:
+                    if self.roi_defined:
+                        print("ROI already defined, ignoring 'c'")
+                    elif roi_start and roi_end:
+                        x1, y1 = roi_start
+                        x2, y2 = roi_end
+                        w = (abs(x2-x1)//16)*16
+                        h = (abs(y2-y1)//16)*16
+                        self.roi = (min(x1, x2), min(y1, y2), w, h)
+                        self.roi_defined = True
+                        print(f"ROI defined: {self.roi}")
+                        self.update_writer = True
+
+                elif key == ord('f') and not self.recording:
+                    self.roi_defined = False
+                    self.roi = None
+                    print("Reset to full frame")
+                    self.update_writer = True
+
+
             last_sync_line_state = sync_line_state
+            self.last_preview_enabled = current_preview_enabled
         # Cleanup
         self.stop_writer()
         self.cam.EndAcquisition()
         cv2.destroyAllWindows()
 
-
     def start_writer(self):
+        with self.queue_lock:
+            self.frame_queue.clear()
+
+
         self.date_now = datetime.datetime.now()
         self.start_rec_time = time.time()
-        self.ttl_log = []  #make sure log is empty log
-        self.frames_times_log = [] #make sure log is empty log
+        self.ttl_log = []
+        self.frames_times_log = []
 
-        ext = 'mkv' if self.compression.get() == "FFV1" else "avi"
+        self.current_thread_writer = self.next_thread_writer
+        self.current_thread_writer.active = True
+        self.next_thread_writer = None
 
-        if not os.path.exists(self.save_path.get()):
-            os.makedirs(self.save_path.get())
-        filename = os.path.join(self.save_path.get(),
-                                f"{self.date_now.strftime('%Y%m%d_%Hh%M')}_trial{self.trial_index}.{ext}")
-        codec = "ffv1" if self.compression.get() == "FFV1" else "rawvideo"
-        self.writer = imageio.get_writer(filename, fps=self.fps.get(), codec=codec)
-        print(f"Recording started: {filename}")
+
+    def prepare_next_writer(self, trial_index):
+        """Create the next writer thread but leave it inactive."""
+        ext = "mkv" if self.compression.get() == "FFV1" else "avi"
+
+        filename = os.path.join(
+            self.save_path.get(),
+            f"{datetime.datetime.now():%Y%m%d_%Hh%M}_trial{trial_index}.{ext}"  ### issue extension
+        )
+
+        already_prep_thread = self.next_thread_writer
+        if already_prep_thread is not None :
+            already_prepared_filename = self.next_thread_writer_filename
+            already_prep_thread.active = False
+            already_prep_thread.stop_flag = True
+            already_prep_thread.join(timeout=1)
+            os.remove(already_prepared_filename)
+            print('[Writer] stop unused prepared thread and erase 0-frame video')
+        self.next_thread_writer_filename = filename
+        t = threading.Thread(target=self.writer_thread, daemon=True)
+        t.active = False
+        t.stop_flag = False
+        t.filename = filename
+        # t.codec = "ffv1" if self.compression.get() == "FFV1" else "rawvideo"  ## imageio style
+        t.codec = "FFV1" if self.compression.get() == "FFV1" else "Y800"   ###opencv
+        t.start()
+        print(f"[Writer] Prewarmed writer for trial {trial_index}")
+        return t
+
+    def writer_thread(self):
+        """Writer thread using OpenCV (pre-sized, no lazy init)."""
+        t = threading.current_thread()
+        fourcc = cv2.VideoWriter_fourcc(*t.codec)
+        fps = self.fps.get()
+        with self.frame_lock:
+            width = self.frame_width
+            height = self.frame_height
+        # Directly use dimensions from the main class
+        writer = cv2.VideoWriter(t.filename, fourcc, fps, (width, height), isColor=False)
+        if not writer.isOpened():
+            print(f"[Writer] ERROR: could not open {t.filename} with codec {t.codec}")
+            return
+
+        print(f"[Writer] Started {t.filename} ({t.codec}, {width}x{height})")
+        while True:
+            if getattr(t, "active", False):
+                frame = None
+                with self.queue_lock:
+                    if self.frame_queue:
+                        frame = self.frame_queue.popleft()
+                if frame is not None:
+                    writer.write(frame)
+                else:
+                    time.sleep(0.001)
+            elif getattr(t, "stop_flag", False):
+                break
+            else:
+                time.sleep(0.1)
+
+        writer.release()
+        print(f"[Writer] Finished writing {t.filename}")
 
     def stop_writer(self):
-        if self.writer:
-            filename = os.path.join(self.save_path.get(), f"{self.date_now.strftime('%Y%m%d_%Hh%M')}_trial{self.trial_index}_sync_ttl.csv")
-            with open(filename, "w", newline='') as f:
+        t = self.current_thread_writer
+        if t is not None :
+            t.active = False
+            t.stop_flag = True
+            t.join()
+            self.current_thread_writer = None
+            # Save TTL timestamps
+            filename_ttl = os.path.join(
+                self.save_path.get(),
+                f"{self.date_now.strftime('%Y%m%d_%Hh%M')}_trial{self.trial_index}_sync_ttl.csv"
+            )
+            with open(filename_ttl, "w", newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(["timestamp_seconds"])
                 for t in self.ttl_log:
                     writer.writerow([t])
-            self.ttl_log = []  #reset log
+            self.ttl_log = []
 
-            filename = os.path.join(self.save_path.get(), f"{self.date_now.strftime('%Y%m%d_%Hh%M')}_trial{self.trial_index}_frame_timestamps.csv")
-            with open(filename, "w", newline='') as f:
+            # Save frame timestamps
+            filename_frames = os.path.join(
+                self.save_path.get(),
+                f"{self.date_now.strftime('%Y%m%d_%Hh%M')}_trial{self.trial_index}_frame_timestamps.csv"
+            )
+            with open(filename_frames, "w", newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(["timestamp_seconds"])
                 for t in self.frames_times_log:
                     writer.writerow([t])
-            self.frames_times_log = []  #reset log
+            self.frames_times_log = []
 
-            print(f"TTL timestamps saved: {filename}")
+            print(f"TTL timestamps saved: {filename_ttl}")
             self.start_rec_time = None
-            self.start_rec_time_hardware =None
-            self.writer.close()
-            self.writer = None
+            self.start_rec_time_hardware = None
             self.trial_index += 1
             print(f"Recording stopped for trial {self.trial_index}")
 
+            self.next_thread_writer = self.prepare_next_writer(self.trial_index)
 
+    
     def get_line_status(self, line_id):
         nodemap = self.cam.GetNodeMap()
         line_selector = PySpin.CEnumerationPtr(nodemap.GetNode("LineSelector"))
@@ -328,6 +439,9 @@ class FLIRApp:
     def start_recording(self):
         if not self.acquiring or self.recording:
             return
+        ### prepare first writer
+        if self.trial_index == 0:
+            self.next_thread_writer = self.prepare_next_writer(self.trial_index)
         self.recording = True
         self.check_save_path()
         print("Recording started")
@@ -335,8 +449,9 @@ class FLIRApp:
     def stop_recording(self):
         self.recording = False
 
-        if self.writer:
+        if self.current_thread_writer and self.current_thread_writer.is_alive():
             self.stop_writer()
+
 
         print("Recording stopped")
 
@@ -361,7 +476,11 @@ class FLIRApp:
             print(f"Warning: system release failed: {e}")
 
         self.root.destroy() 
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = FLIRApp(root)
     root.mainloop()
+
+
+
