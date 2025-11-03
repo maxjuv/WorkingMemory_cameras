@@ -79,7 +79,7 @@ class FLIRApp:
         self.mode = tk.StringVar(value="Continuous")
         self.fps = tk.DoubleVar(value=30.0)
         self.brightness = tk.DoubleVar(value=1.0)
-        self.compression = tk.StringVar(value="FFV1")
+        self.compression = tk.StringVar(value="RAW")
         self.last_compression = self.compression.get()
         self.exposure_time = tk.DoubleVar(value=15.0)  # microseconds (example default 5 ms)
         self.trial_index = 0
