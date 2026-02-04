@@ -1,4 +1,3 @@
-import PySpin
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from collections import deque
@@ -6,12 +5,23 @@ import threading
 import os
 import cv2
 import numpy as np
-# import imageio
 import datetime
 import time
 import csv
+import platform
+import PySpin
 
-default_path = 'C:/Users/alan/Desktop/'
+system_name = platform.system()  # 'Windows', 'Linux', 'Darwin' (macOS)
+machine = platform.machine()     # architecture info, e.g., 'x86_64', 'armv7l'
+
+if system_name == 'Linux' and machine=='aarch64':
+    default_path = '/home/carletonlab/Desktop/'
+
+elif system_name=='Windows':
+    default_path = 'C:/Users/alan/Desktop/'
+
+
+
 default_foldername = None
 
 sync_line_id = 2
